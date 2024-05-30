@@ -801,3 +801,214 @@ class MultimodalTransformer(Transformer):
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
         self.grad_checkpointing = enable
+
+from functools import reduce
+from operator import mul
+import math
+
+
+class VisionTransformerVPT(VisionTransformer):
+    def __init__(self,
+                 image_size,
+                 patch_size,
+                 width,
+                 layers,
+                 heads,
+                 mlp_ratio,
+                 ls_init_value,
+                 patch_dropout,
+                 attentional_pool,
+                 attn_pooler_queries,
+                 attn_pooler_heads,
+                 pos_embed_type,
+                 no_ln_pre,
+                 final_ln_after_pool,
+                 pool_type,
+                 output_tokens,
+                 output_dim,
+                 act_layer,
+                 norm_layer,
+                 VPT_Prompt_Token_Num : int = 1,
+                 VPT_Project_dim : int = -1, # understand what it does
+                 VPT_type = "Shallow",
+                 VPT_Deep_Shared = "False",
+                 VPT_Dropout: float = 0.1,
+                 VPT_Initiation = 'random',
+                 VPT_Location = 'prepend',
+                 VPT_Num_Deep_Layers = None, 
+                 VPT_Reverse_Deep: bool = False,
+                 VPT_VIT_Pool_Type = 'original',
+                 VPT_Forward_Deep_Noexpand = 'False',
+                 VPT_init_method='random',
+                 *args,
+                 **kwargs):
+        
+        # TODO can make everything needed for regular ViT as **kwargs, just check how they are made
+        super().__init__(image_size, patch_size, width, layers, heads, mlp_ratio, *args, **kwargs)
+
+        self.VPT_Prompt_Token_Num = VPT_Prompt_Token_Num
+        self.embed_dim = width
+        # Optional: Dropout on prompts
+        self.prompt_dropout = nn.Dropout(p=0.1)
+
+        if VPT_Project_dim > -1:
+            prompt_dim = VPT_Project_dim
+            self.VPT_proj = nn.Linear(prompt_dim, self.embed_dim)
+            nn.init.kaiming_normal_(self.VPT_proj.weight, a = 0, mode='fan_out')
+            self.VPT_proj.bias.data.fill_(0.01) # TODO do we really need this?
+        else:
+            prompt_dim = self.embed_dim
+            self.VPT_proj = nn.Identity()
+
+
+        # Initialize prompt:
+        if VPT_init_method == 'random':
+            val = math.sqrt(6. / float(3 * reduce(mul, (patch_size,patch_size), 1) + prompt_dim)) # TODO check the kwargs
+            
+            self.prompt_embeddings = nn.Parameter(torch.zeros(1, self.VPT_Prompt_Token_Num, self.embed_dim))
+
+            # xavier_uniform_initialization
+            nn.init.uniform_(self.prompt_embeddings.data, -val, val)
+
+            if VPT_type == 'DEEP': # TODO fix this
+                total_d_layer = self.depth-1 # since first layer is shallow
+                self.deep_prompt_embeddings = nn.Parameter(torch.zeros(
+                    total_d_layer, self.VPT_Prompt_Token_Num, prompt_dim))
+                # xavier_uniform initialization
+                nn.init.uniform_(self.deep_prompt_embeddings.data, -val, val)
+        else:
+            raise ValueError("No other init scheme supported by VPT authors")
+
+        # Optional: Projection for prompts if dimensions differ
+        # self.prompt_projection = nn.Linear(self.embed_dim, self.embed_dim) if width != self.embed_dim else nn.Identity()
+
+
+
+    def _incorporate_prompt(self, x: torch.Tensor) -> torch.Tensor:
+        """ Combine prompts with image-patch embeddings
+
+        Args:
+            x (Input): Input img patches
+
+        Returns:
+            _type_: embeddings with VPT prompts
+        """
+        batch_size = x.shape[0] # check the shape here once, but it should be the batch of embeddings
+        # x = self.embeddings(x) # this is handled by the functions patch embedding process 
+        
+        # get the VPT embeddings
+        VPT_Embeddings = self.VPT_proj(self.prompt_embeddings.expand(batch_size, -1, -1)) # self.Prompt_Dropout
+        
+        # Prepend the embeddings
+        x = torch.cat((x, VPT_Embeddings), dim=1)
+        # (batch_size, cls_token + n_prompt + n_patches, hidden_dim)
+        # x = torch.cat((x[:, :1, :],VPT_embeddings, x[;, 1:, :],), dim=1)
+        
+        # x = torch.cat((
+        #     x[;, :1, :],
+        #     self.Prompt_Dropout(self.VPT_proj(self.VPT_Embeddings)).expand(batch_size, -1, -1),
+        #     x[:, 1:, :]
+        # ), dim =1)
+
+        return x
+    
+    def _train(self, mode=True):
+        """ set train status for this class: disable all but the prompt-related modules
+        
+        Args:
+            mode (bool, optional): Train mode or eval mode. Defaults to True.
+
+        Returns:
+            _type_: _description_
+        """
+        if mode: # check with the named blocks, they are different from TIMM
+            # training
+            self.base_model.encoder.eval() # check encoder block? doesn't exist in openclip
+            self.embeddings.eval() 
+            self.prompt_proj.train() # understand why?
+            self.prompt_dropout.train() # understand why?
+        else:
+            # eval:
+            for module in self.children():
+                module.train(mode)
+
+    def freeze_all_parameters(self):
+        """Freeze all parameters in the model."""
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def unfreeze_prompt_parameters(self):
+        """Unfreeze visual prompt parameters for training."""
+        self.prompt_embeddings.requires_grad = True
+        if hasattr(self, 'deep_prompt_embeddings'):
+            self.deep_prompt_embeddings.requires_grad = True
+
+
+    # def forward_features(self, x):
+    #     # Get patch embeddings from the original VisionTransformer
+    #     x = super().forward_features(x)
+
+    #     # Project prompt embeddings to the dimension of patch embeddings
+    #     batch_size = x.shape[0]
+    #     prompts = self.prompt_projection(self.prompt_embeddings.expand(batch_size, -1, -1))
+    #     prompts = self.prompt_dropout(prompts)
+
+    #     # Prepend or append prompts based on your configuration
+    #     x = torch.cat((prompts, x), dim=1)
+
+    #     return x
+
+    # def forward(self, x):
+    #     x = self.forward_features(x)
+    #     return self.head(x[:, 0])
+
+# Note: Adjust the model instantiation and training loops to accommodate the new model class.
+
+    def forward(self, x):
+        # Step 1: Convert image to patch embeddings
+        x = self.conv1(x)
+        x = x.view(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
+
+        # Step 2: Add class token and positional embeddings
+        x = torch.cat([self.class_embedding.expand(x.shape[0], -1, -1), x], dim=1)
+        x = x + self.positional_embedding.to(x.dtype)
+
+        # Step 3: Incorporate VPT Prompts
+        x = self._incorporate_prompt(x)
+        
+        # if self.VPT_Prompt_Token_Num > 0:
+        #     batch_size = x.shape[0]
+        #     prompts = self.prompt_projection(self.prompt_embeddings.expand(batch_size, -1, -1))
+        #     prompts = self.prompt_dropout(prompts)
+        #     if self.VPT_Location == 'prepend':
+        #         x = torch.cat([prompts, x], dim=1)
+        #     elif self.VPT_Location == 'append':
+        #         x = torch.cat([x, prompts], dim=1)
+
+        # Apply dropout to patches if configured
+        x = self.patch_dropout(x)
+        
+        # Pre-transformer layer normalization if not skipped
+        x = self.ln_pre(x)
+
+        # Step 4: Pass through transformer blocks
+        x = x.permute(1, 0, 2)  # Change to (L, N, D) for transformer
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # Back to (N, L, D)
+
+        # Step 5: Pooling and projection
+        if self.attn_pool is not None:
+            x = self.attn_pool(x)
+            x = self.ln_post(x)
+            pooled, tokens = self._global_pool(x)
+        else:
+            x = self.ln_post(x)
+            pooled, tokens = self._global_pool(x)
+
+        if self.proj is not None:
+            pooled = pooled @ self.proj
+
+        if self.output_tokens:
+            return pooled, tokens
+
+        return pooled

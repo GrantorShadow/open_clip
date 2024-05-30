@@ -19,7 +19,7 @@ from .hf_model import HFTextEncoder
 from .modified_resnet import ModifiedResNet
 from .timm_model import TimmModel
 from .transformer import LayerNormFp32, LayerNorm, QuickGELU, Attention, VisionTransformer, TextTransformer,\
-    text_global_pool
+    text_global_pool, VisionTransformerVPT
 from .utils import to_2tuple
 
 
@@ -145,27 +145,52 @@ def _build_vision_tower(
         if vision_cfg.act_kwargs is not None:
             act_layer = partial(act_layer, **vision_cfg.act_kwargs)
 
-        visual = VisionTransformer(
-            image_size=vision_cfg.image_size,
-            patch_size=vision_cfg.patch_size,
-            width=vision_cfg.width,
-            layers=vision_cfg.layers,
-            heads=vision_heads,
-            mlp_ratio=vision_cfg.mlp_ratio,
-            ls_init_value=vision_cfg.ls_init_value,
-            patch_dropout=vision_cfg.patch_dropout,
-            attentional_pool=vision_cfg.attentional_pool,
-            attn_pooler_queries=vision_cfg.attn_pooler_queries,
-            attn_pooler_heads=vision_cfg.attn_pooler_heads,
-            pos_embed_type=vision_cfg.pos_embed_type,
-            no_ln_pre=vision_cfg.no_ln_pre,
-            final_ln_after_pool=vision_cfg.final_ln_after_pool,
-            pool_type=vision_cfg.pool_type,
-            output_tokens=vision_cfg.output_tokens,
-            output_dim=embed_dim,
-            act_layer=act_layer,
-            norm_layer=norm_layer,
-        )
+        if vision_cfg.use_vpt:
+             # TODO add VPT attribs in the vision config
+             visual = VisionTransformerVPT(
+                 image_size=vision_cfg.image_size,
+                 patch_size=vision_cfg.patch_size,
+                 width=vision_cfg.width,
+                 layers=vision_cfg.layers,
+                 heads=vision_heads,
+                 mlp_ratio=vision_cfg.mlp_ratio,
+                 ls_init_value=vision_cfg.ls_init_value,
+                 patch_dropout=vision_cfg.patch_dropout,
+                 attentional_pool=vision_cfg.attentional_pool,
+                 attn_pooler_queries=vision_cfg.attn_pooler_queries,
+                 attn_pooler_heads=vision_cfg.attn_pooler_heads,
+                 pos_embed_type=vision_cfg.pos_embed_type,
+                 no_ln_pre=vision_cfg.no_ln_pre,
+                 final_ln_after_pool=vision_cfg.final_ln_after_pool,
+                 pool_type=vision_cfg.pool_type,
+                 output_tokens=vision_cfg.output_tokens,
+                 output_dim=embed_dim,
+                 act_layer=act_layer,
+                 norm_layer=norm_layer,
+                 VPT_Prompt_Token_Num=vision_cfg.VPT_Prompt_Token_Num
+            )
+        else:
+            visual = VisionTransformer(
+                image_size=vision_cfg.image_size,
+                patch_size=vision_cfg.patch_size,
+                width=vision_cfg.width,
+                layers=vision_cfg.layers,
+                heads=vision_heads,
+                mlp_ratio=vision_cfg.mlp_ratio,
+                ls_init_value=vision_cfg.ls_init_value,
+                patch_dropout=vision_cfg.patch_dropout,
+                attentional_pool=vision_cfg.attentional_pool,
+                attn_pooler_queries=vision_cfg.attn_pooler_queries,
+                attn_pooler_heads=vision_cfg.attn_pooler_heads,
+                pos_embed_type=vision_cfg.pos_embed_type,
+                no_ln_pre=vision_cfg.no_ln_pre,
+                final_ln_after_pool=vision_cfg.final_ln_after_pool,
+                pool_type=vision_cfg.pool_type,
+                output_tokens=vision_cfg.output_tokens,
+                output_dim=embed_dim,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+            )
 
     return visual
 
@@ -233,6 +258,11 @@ class CLIP(nn.Module):
     ):
         super().__init__()
         self.output_dict = output_dict
+
+        print("code goes here")
+        # VPT args
+        vision_cfg.use_vpt = True
+        vision_cfg.VPT_Prompt_Token_Num = 10
 
         self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
 
@@ -502,7 +532,7 @@ def build_model_from_openai_state_dict(
     for key in ["input_resolution", "context_length", "vocab_size"]:
         state_dict.pop(key, None)
     convert_weights_to_fp16(model)  # OpenAI state dicts are partially converted to float16
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False) # setting strict to false to allow VPT embeds to be a part
     return model.eval()
 
 

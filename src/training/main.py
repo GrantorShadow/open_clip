@@ -13,6 +13,8 @@ import torch
 from torch import optim
 from torch.cuda.amp import GradScaler
 
+from torch import nn
+
 try:
     import wandb
 except ImportError:
@@ -28,7 +30,8 @@ try:
 except ImportError:
     hvd = None
 
-from open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss
+from open_clip.factory import create_model_and_transforms, get_tokenizer, create_loss
+from open_clip.model import trace_model
 from training.data import get_data
 from training.distributed import is_master, init_distributed_device, broadcast_object
 from training.logger import setup_logging
@@ -66,6 +69,40 @@ def get_latest_checkpoint(path: str, remote : bool):
         checkpoints = sorted(checkpoints, key=natural_key)
         return checkpoints[-1]
     return None
+
+def interpolate_pos_embed(orig_pos_embed, new_pos_embed, mod_num_patches):
+    """interpolate the position embedding with the new size
+    taken from https://github.com/mlfoundations/open_clip/blob/73fa7f03a33da53653f61841eb6d69aef161e521/src/open_clip/pos_embed.py#L75
+
+    Args:
+        pos_embed (_type_): _description_
+
+    Returns:
+        _type_: _description_
+    """
+    original_embedding_size = orig_pos_embed.shape[-1]  # original patch embeds 768
+    new_num_patches = mod_num_patches  # new num patches / old was 196 ; new will be 49
+    new_num_extra_tokens = new_pos_embed.shape[-2] - new_num_patches  # new num extra patches - class token
+        
+    # height (== width) for the checkpoint position embedding
+    orig_size = int((orig_pos_embed.shape[-2] - new_num_extra_tokens) ** 0.5)
+    # height (== width) for the new position embedding
+    new_size = int(new_num_patches ** 0.5)
+
+    # class_token and dist_token are kept unchanged
+    if orig_size != new_size:
+        print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+        extra_tokens = orig_pos_embed[-new_num_extra_tokens:, :]
+        extra_tokens = extra_tokens.unsqueeze(0)
+        # only the position tokens are interpolated
+        pos_tokens = orig_pos_embed[:-new_num_extra_tokens, :]
+        pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size, original_embedding_size).permute(0, 3, 1, 2)
+        pos_tokens = torch.nn.functional.interpolate(
+            pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+        pos_tokens = pos_tokens.permute(0, 2, 3, 1).flatten(1, 2)
+        new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
+        return new_pos_embed
+
 
 
 def main(args):
@@ -239,6 +276,202 @@ def main(args):
         output_dict=True,
         **model_kwargs,
     )
+
+
+    # # save the original weights
+    # orig_conv1 = model.visual.conv1
+    # orig_pos_embed = model.visual.positional_embedding
+
+    # # change the model vision transformer to a patchsize updated ViT
+    # # model.
+    # model.visual.conv1 = nn.Conv2d(3, 768, kernel_size=(32, 32), stride=(32, 32), bias=False)
+    
+    # scale = 768 ** -0.5
+    # model.visual.positional_embedding = nn.Parameter(scale * torch.randn(7 * 7 + 1, 768)) # this includes the class embedding
+
+    # # TODO formalize this ; very brittle 
+    # nn.init.kaiming_uniform_(model.visual.conv1.weight.data)
+    # nn.init.kaiming_uniform_(model.visual.positional_embedding)
+
+    # # Cast the conv1 layer's weight to the same data type as the input tensor
+    # # model.visual.conv1.weight.data = model.visual.conv1.weight.to(torch.float16)
+    
+    # orig_num_patches = (224 // 16) ** 2  # Original number of patches (assuming 224x224 image and 16x16 patches)
+    # new_num_patches = (224 // 32) ** 2  # New number of patches (assuming 224x224 image and 32x32 patches)
+    # # if interpolate:
+    # # interpolate the weights from 16x16 to 32x32
+    # # resize the patch + pos embeddings
+    # model.visual.conv1.weight.data = torch.nn.functional.interpolate(orig_conv1.weight.data,
+    #                                                               size=(32, 32),
+    #                                                               mode='bilinear',
+    #                                                               align_corners=False)
+
+    # model.visual.positional_embedding.data = interpolate_pos_embed(orig_pos_embed.data,
+    #                                                                model.visual.positional_embedding, mod_num_patches=49)
+
+
+    # model.visual.conv1.weight = torch.nn.Parameter(model.visual.conv1.weight) # convert back to parameter
+    # model.visual.positional_embedding = torch.nn.Parameter(model.visual.positional_embedding)
+
+    # # Ensure the weights are on the correct device and data type immediately after initialization
+    # if torch.cuda.is_available():
+    #     model.visual.conv1.weight.data = model.visual.conv1.weight.data.to(device).half()  # Move to GPU and convert to half precision
+    #     model.visual.positional_embedding.data = model.visual.positional_embedding.data.to(device).half()
+    #     model = model.to(device)
+    def interpolate_pos_embed(orig_pos_embed, new_pos_embed, orig_class_embed, mod_num_patches):
+        """interpolate the position embedding with the new size
+        taken from https://github.com/mlfoundations/open_clip/blob/73fa7f03a33da53653f61841eb6d69aef161e521/src/open_clip/pos_embed.py#L75
+
+        Args:
+            orig_pos_embed (torch.Tensor): Original position embeddings with shape [197, 768]
+            new_pos_embed (torch.Tensor): New position embeddings with shape [50, 768]
+            mod_num_patches (int): Number of patches in the modified model (e.g., 49 for 32x32 patches)
+
+        Returns:
+            torch.Tensor: Interpolated position embeddings with shape [50, 768]
+        """
+        original_embedding_size = orig_pos_embed.shape[-1]  # original patch embeds 768
+        new_num_patches = mod_num_patches  # new num patches / old was 196 ; new will be 49
+        new_num_extra_tokens = new_pos_embed.shape[-2] - new_num_patches  # new num extra patches - class token
+            
+        # height (== width) for the checkpoint position embedding
+        orig_size = int((orig_pos_embed.shape[-2] - new_num_extra_tokens) ** 0.5)
+        # height (== width) for the new position embedding
+        new_size = int(new_num_patches ** 0.5)
+
+        # class_token and dist_token are kept unchanged
+        # if orig_size != new_size:
+        print("Position interpolate from %dx%d to %dx%d" % (orig_size, orig_size, new_size, new_size))
+        class_token = orig_pos_embed[:new_num_extra_tokens, :] # new_num_extra_tokens is always 1
+        # extra_tokens = extra_tokens.unsqueeze(0)
+        # only the position tokens are interpolated
+        pos_tokens = orig_pos_embed[new_num_extra_tokens:, :]
+        pos_tokens = pos_tokens.reshape(orig_size, orig_size, original_embedding_size).permute(2, 0, 1)
+        pos_tokens = torch.nn.functional.interpolate(pos_tokens.unsqueeze(0),
+                                                        size=(new_size, new_size),
+                                                        mode='bicubic',
+                                                            align_corners=False).squeeze(0)
+        pos_tokens = pos_tokens.permute(1, 2, 0).flatten(0, 1)
+        orig_class_embed = orig_class_embed.unsqueeze(0)
+        new_pos_embed = torch.cat((orig_class_embed, pos_tokens), dim=0)
+        return new_pos_embed
+
+            
+        # class_token = orig_pos_embed[:1, :]
+        # # only the position tokens are interpolated
+        # pos_tokens = orig_pos_embed[1:, :]
+        # pos_tokens = pos_tokens.reshape(orig_size, orig_size, original_embedding_size).permute(2, 0, 1)
+        # pos_tokens = torch.nn.functional.interpolate(
+        #     pos_tokens.unsqueeze(0), size=(new_size, new_size), mode='bicubic', align_corners=False).squeeze(0)
+        # pos_tokens = pos_tokens.permute(1, 2, 0).flatten(0, 1)
+        # new_pos_embed = torch.cat((class_token, pos_tokens), dim=0)
+        # return new_pos_embed
+    
+    def interpolate_pos_embed_test(orig_pos_embed, new_pos_embed, orig_class_embed, mod_num_patches):
+        original_embedding_size = orig_pos_embed.shape[-1]
+        new_num_patches = mod_num_patches
+        new_num_extra_tokens = new_pos_embed.shape[0] - new_num_patches
+
+        # Calculate original size based on the position embeddings minus the extra tokens
+        orig_size = int((orig_pos_embed.shape[0] - new_num_extra_tokens) ** 0.5)
+        new_size = int(new_num_patches ** 0.5)
+
+        print(f"Interpolating position embeddings from {orig_size}x{orig_size} to {new_size}x{new_size}")
+
+        # Class tokens remain unchanged
+        class_token = orig_pos_embed[:new_num_extra_tokens, :] 
+        pos_tokens = orig_pos_embed[new_num_extra_tokens:, :]
+
+        # Reshape and interpolate positional tokens
+        pos_tokens = pos_tokens.reshape(1, orig_size, orig_size, original_embedding_size).permute(0, 3, 1, 2)
+        pos_tokens = torch.nn.functional.interpolate(
+            pos_tokens, size=(new_size, new_size), mode='bicubic', align_corners=False)
+        pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(-1, original_embedding_size)
+
+        # Concatenate class tokens back with interpolated positional tokens
+        new_pos_embed = torch.cat((class_token, pos_tokens), dim=0)
+        return new_pos_embed
+
+
+    orig_conv1 = model.visual.conv1
+    orig_pos_embed = model.visual.positional_embedding # [197, 768] 16 patch size
+    orig_class_embed = model.visual.positional_embedding.data[0] # orig class token
+
+    model.visual.conv1 = nn.Conv2d(
+        in_channels=3,
+        out_channels=768,
+        kernel_size=(18, 18),
+        stride=(18, 18),
+        bias=False
+    )
+
+    # orig_num_patches = (model.visual.image_size[0] // 16) ** 2
+    # new_num_patches = (model.visual.image_size[0] // 32) ** 2
+    new_num_patches = 144 #49 #121 # 144 #49 
+    model.visual.positional_embedding = nn.Parameter(
+        torch.zeros(new_num_patches+1, 768)
+    )
+
+    model.visual.conv1.weight.data = torch.nn.functional.interpolate(
+        orig_conv1.weight.data,
+        size=(18, 18),
+        mode='bilinear',
+        align_corners=False
+    )
+
+      # Original position embeddings [1, 197, 768]
+    mod_num_patches = 144 # 49 # 121 # 144 #   # Number of patches in the modified model (32x32 patches)
+    
+
+    model.visual.positional_embedding.data = interpolate_pos_embed_test(orig_pos_embed, 
+                                                              model.visual.positional_embedding,
+                                                              orig_class_embed,
+                                                              mod_num_patches)
+
+    # # # damage testing
+    # # # down interpolate teh patch embedding
+    # id_patch_embedding = nn.Conv2d(
+    #     in_channels=3,
+    #     out_channels=768,
+    #     kernel_size=(16, 16),
+    #     stride=(16, 16),
+    #     bias=False
+    # )
+
+    # id_patch_embedding.data = torch.nn.functional.interpolate(
+    #     model.visual.conv1.weight.data,
+    #     size=(16, 16),
+    #     mode='bilinear',
+    #     align_corners=False
+    # )
+
+    # id_new_num_patches = 196
+    # id_positional_embedding = nn.Parameter(
+    #     torch.zeros(new_num_patches+1, 768)
+    # )
+
+
+
+
+    # id_positional_embedding.data = interpolate_pos_embed_test(model.visual.positional_embedding, 
+    #                                                           orig_pos_embed,
+    #                                                           orig_class_embed,
+    #                                                           mod_num_patches=id_new_num_patches)
+
+
+    
+    # model.visual.conv1 = id_patch_embedding
+    # model.visual.positional_embedding = id_positional_embedding
+
+    # nn.init.kaiming_uniform_(model.visual.conv1.weight, a=0, mode='fan_in', nonlinearity='conv2d')
+    # nn.init.normal_(model.visual.positional_embedding, std=0.02)
+
+    if torch.cuda.is_available():
+        model.visual.conv1.weight.data = model.visual.conv1.weight.data.to(device).half()
+        model.visual.positional_embedding.data = model.visual.positional_embedding.data.to(device).half()
+        model = model.to(device)
+
+
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
         dist_model, _, _ = create_model_and_transforms(
